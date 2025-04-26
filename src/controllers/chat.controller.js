@@ -87,7 +87,7 @@ exports.getMessages = async (req, res) => {
     const messages = await ChatMessage.find(query)
       .sort({ timestamp: -1 })
       .limit(parseInt(limit))
-      .populate('user_id', 'name email profile_image')
+      // .populate('user_id', 'name email profile_image')
       .lean();
 
     // Mark messages as read by this user

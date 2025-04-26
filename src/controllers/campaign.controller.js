@@ -124,9 +124,16 @@ exports.getCampaignById = async (req, res) => {
     });
 
     // Get all members
-    const members = await CampaignMember.find({
+    const membersData = await CampaignMember.find({
       campaign_id: campaignId,
-    }).populate('user_id', '_id name email phone');
+    }).populate('user_id');
+
+    // Map over members to format the data structure
+    const members = membersData.map((member) => ({
+      ...member.toObject(),
+      user: member.user_id,
+      user_id: member.user_id._id,
+    }));
 
     res.status(200).json({
       ...campaign.toObject(),
