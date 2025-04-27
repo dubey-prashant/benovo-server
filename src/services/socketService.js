@@ -1,4 +1,8 @@
 const socketIo = require('socket.io');
+const Invitation = require('../models/invitation.model');
+const User = require('../models/user.model');
+const Campaign = require('../models/campaign.model');
+const Notification = require('../models/notification.model'); // Assuming you have a notification model
 
 function initializeSocket(server) {
   const io = socketIo(server, {
@@ -46,6 +50,118 @@ function initializeSocket(server) {
           userId: socket.userId,
           message: data.message,
           timestamp: new Date(),
+        });
+      }
+    });
+
+    // Notification for new invitation
+    socket.on('send-invitation', async (data) => {
+      try {
+        // Validate input
+        if (!data || !data.toUserEmail || !data.campaignId || !socket.userId) {
+          console.error('Invalid invitation data', data);
+          socket.emit('invitation-error', {
+            message: 'Invalid invitation data',
+          });
+          return;
+        }
+
+        // Find the recipient user
+        const recipient = await User.findOne({
+          email: data.toUserEmail.toLowerCase(),
+        });
+        if (!recipient) {
+          socket.emit('invitation-error', { message: 'User not found' });
+          return;
+        }
+
+        // Find the campaign
+        const campaign = await Campaign.findById(data.campaignId);
+        if (!campaign) {
+          socket.emit('invitation-error', { message: 'Campaign not found' });
+          return;
+        }
+
+        // Check if invitation already exists
+        const existingInvitation = await Invitation.findOne({
+          campaign_id: data.campaignId,
+          email: data.toUserEmail.toLowerCase(),
+          status: 'pending',
+        });
+
+        if (existingInvitation) {
+          socket.emit('invitation-error', {
+            message: 'Invitation already sent',
+          });
+          return;
+        }
+
+        // Create invitation in database
+        const invitation = new Invitation({
+          campaign_id: data.campaignId,
+          email: data.toUserEmail.toLowerCase(),
+          invited_by: socket.userId,
+          status: 'pending',
+          expires_at: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000), // 7 days from now
+        });
+
+        await invitation.save();
+
+        // Create notification for the recipient
+        if (recipient) {
+          const notification = new Notification({
+            user_id: recipient._id,
+            type: 'invitation',
+            title: 'New Campaign Invitation',
+            message: `You've been invited to join ${campaign.name}`,
+            data: {
+              invitationId: invitation._id,
+              campaignId: data.campaignId,
+              campaignName: campaign.name,
+              fromUserId: socket.userId,
+            },
+            read: false,
+          });
+
+          await notification.save();
+
+          // Send real-time notification if recipient is online
+          const recipientSocketId = connectedUsers.get(
+            recipient._id.toString()
+          );
+          if (recipientSocketId) {
+            io.to(recipientSocketId).emit('invitation-received', {
+              invitationId: invitation._id,
+              campaignId: data.campaignId,
+              campaignName: campaign.name,
+              fromUserId: socket.userId,
+              fromUserName: data.fromUserName || 'A campaign admin',
+            });
+          }
+        }
+
+        // Notify sender of success
+        socket.emit('invitation-sent', {
+          invitationId: invitation._id,
+          email: data.toUserEmail,
+          campaignId: data.campaignId,
+        });
+
+        // Notify all admins in the campaign room about the new invitation
+        io.to(`campaign-${data.campaignId}`).emit('campaign-updated', {
+          type: 'new-invitation',
+          campaignId: data.campaignId,
+          invitation: {
+            id: invitation._id,
+            email: data.toUserEmail,
+            status: 'pending',
+            created_at: invitation.createdAt,
+          },
+        });
+      } catch (error) {
+        console.error('Error processing invitation:', error);
+        socket.emit('invitation-error', {
+          message: 'Failed to process invitation',
         });
       }
     });

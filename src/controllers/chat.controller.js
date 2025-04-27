@@ -40,11 +40,17 @@ exports.sendMessage = async (req, res) => {
       .populate('user_id', 'name email profile_image')
       .lean();
 
+    const finalMessage = {
+      ...populatedMessage,
+      user: populatedMessage.user_id,
+      user_id: populatedMessage.user_id._id,
+    };
+
     // Emit the message via Socket.io
     const io = req.app.get('io');
-    io.to(`campaign:${campaignId}`).emit('newMessage', populatedMessage);
+    io.to(`campaign-${campaignId}`).emit('newMessage', finalMessage);
 
-    res.status(201).json(populatedMessage);
+    res.status(201).json(finalMessage);
   } catch (error) {
     console.error('Error sending message:', error);
     res.status(500).json({
