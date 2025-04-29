@@ -15,7 +15,7 @@ router.post(
 router.post('/', campaignController.createCampaign);
 router.get('/', campaignController.getUserCampaigns);
 router.get('/:id', campaignController.getCampaignById);
-router.delete('/:id', campaignController.deleteCampaign); // Add delete campaign route
+router.delete('/:id', campaignController.deleteCampaign);
 
 // Invitation routes
 router.post('/:id/invite', campaignController.inviteMember);
@@ -35,6 +35,9 @@ router.put(
   campaignController.updateMemberAllocation
 );
 
-// User invitation response routes
+// Payment routes
+router.post('/:id/contributions', campaignController.recordContribution);
+router.get('/:id/contributions', campaignController.getCampaignContributions);
+router.get('/contributions/user', campaignController.getUserContributions);
 
 module.exports = router;

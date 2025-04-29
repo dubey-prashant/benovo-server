@@ -42,6 +42,12 @@ function initializeSocket(server) {
       }
     });
 
+    // Join a campaign room with new format
+    socket.on('join-campaign', (campaignId) => {
+      socket.join(`campaign:${campaignId}`);
+      console.log(`User ${socket.userId} joined campaign room: ${campaignId}`);
+    });
+
     // Send message in campaign chat
     socket.on('campaign-message', (data) => {
       if (data && data.campaignId && data.message) {
@@ -177,5 +183,16 @@ function initializeSocket(server) {
 
   return io;
 }
+
+// // When a new contribution is recorded
+// // Add this to your recordContribution function
+// if (io) {
+//   io.to(`campaign:${campaignId}`).emit('new-contribution', {
+//     contribution: populatedContribution,
+//     message: `${contributorName} made a payment of ${formatCurrency(
+//       amount
+//     )} to ${recipientName}`,
+//   });
+// }
 
 module.exports = { initializeSocket };

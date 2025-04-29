@@ -2,6 +2,7 @@ const Campaign = require('../models/campaign.model');
 const CampaignMember = require('../models/campaignMember.model');
 const User = require('../models/user.model');
 const Invitation = require('../models/invitation.model');
+const Contribution = require('../models/contribution.model');
 
 exports.createCampaign = async (req, res) => {
   try {
@@ -95,54 +96,63 @@ exports.getUserCampaigns = async (req, res) => {
     });
   }
 };
-
 exports.getCampaignById = async (req, res) => {
   try {
-    const campaignId = req.params.id;
+    const { id } = req.params;
     const userId = req.userId;
-    console.log('req.params', req.params);
-    console.log('campaignId', campaignId);
-    // Check if user is a member of the campaign
-    const membership = await CampaignMember.findOne({
-      campaign_id: campaignId,
-      user_id: userId,
-    });
 
-    if (!membership) {
-      return res
-        .status(403)
-        .json({ message: 'Not authorized to access this campaign' });
-    }
-
-    // Get campaign with member count
-    const campaign = await Campaign.findById(campaignId);
+    // Find campaign by ID
+    const campaign = await Campaign.findById(id);
 
     if (!campaign) {
       return res.status(404).json({ message: 'Campaign not found' });
     }
 
-    const memberCount = await CampaignMember.countDocuments({
-      campaign_id: campaignId,
+    // Check if user is a member
+    const isMember = await CampaignMember.exists({
+      campaign_id: id,
+      user_id: userId,
     });
 
-    // Get all members
-    const membersData = await CampaignMember.find({
-      campaign_id: campaignId,
-    }).populate('user_id');
+    if (!isMember) {
+      return res
+        .status(403)
+        .json({ message: 'Not authorized to view this campaign' });
+    }
 
-    // Map over members to format the data structure
-    const members = membersData.map((member) => ({
+    // Get campaign members with user details
+    const members = await CampaignMember.find({ campaign_id: id }).populate(
+      'user_id',
+      '_id name email'
+    );
+
+    const memberDetails = members.map((member) => ({
       ...member.toObject(),
       user: member.user_id,
       user_id: member.user_id._id,
     }));
 
-    res.status(200).json({
-      ...campaign.toObject(),
-      members,
-      memberCount,
-      is_admin: membership.is_admin,
-    });
+    // Get pending invitations
+    const invitations = await Invitation.find({
+      campaign_id: id,
+      status: 'pending',
+    }).select('email invited_by status created_at');
+
+    // Get contributions
+    const contributions = await Contribution.find({ campaign_id: id })
+      .populate('contributor_id', 'name email')
+      .populate('recipient_id', 'name email')
+      .sort({ created_at: -1 });
+
+    // Add members and invitations to campaign
+    const campaignWithDetails = {
+      ...campaign._doc,
+      members: memberDetails,
+      invitations,
+      contributions,
+    };
+
+    res.status(200).json(campaignWithDetails);
   } catch (error) {
     console.error('Error fetching campaign:', error);
     res.status(500).json({
@@ -737,6 +747,193 @@ exports.removeMember = async (req, res) => {
     console.error('Error removing member:', error);
     res.status(500).json({
       message: 'Failed to remove member',
+      error: error.message,
+    });
+  }
+};
+
+/**
+ * Record a new contribution/payment
+ */
+exports.recordContribution = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const campaignId = id;
+    const { amount, recipient_id, notes } = req.body;
+    const contributor_id = req.userId;
+
+    // Validate the campaign exists
+    const campaign = await Campaign.findById(campaignId);
+    if (!campaign) {
+      return res.status(404).json({ message: 'Campaign not found' });
+    }
+
+    // Validate contributor is a campaign member
+    const contributorIsMember = await CampaignMember.exists({
+      campaign_id: campaignId,
+      user_id: contributor_id,
+    });
+
+    if (!contributorIsMember) {
+      return res.status(403).json({
+        message: 'You must be a member of the campaign to make contributions',
+      });
+    }
+
+    // Validate recipient is a campaign member
+    const recipientIsMember = await CampaignMember.exists({
+      campaign_id: campaignId,
+      user_id: recipient_id,
+    });
+
+    if (!recipientIsMember) {
+      return res.status(400).json({
+        message: 'Recipient must be a member of the campaign',
+      });
+    }
+
+    // Create the contribution record
+    const contribution = new Contribution({
+      campaign_id: campaignId,
+      contributor_id,
+      recipient_id,
+      amount,
+      notes,
+      created_at: new Date(),
+    });
+
+    await contribution.save();
+
+    // If this is current month's recipient, update their payout status
+    const recipientMember = await CampaignMember.findOne({
+      campaign_id: campaignId,
+      user_id: recipient_id,
+    });
+
+    if (recipientMember && recipientMember.allocated_month) {
+      const now = new Date();
+      const allocationMonth = new Date(recipientMember.allocated_month);
+
+      if (
+        allocationMonth.getMonth() === now.getMonth() &&
+        allocationMonth.getFullYear() === now.getFullYear()
+      ) {
+        // Count contributions for this member this month
+        const contributionCount = await Contribution.countDocuments({
+          campaign_id: campaignId,
+          recipient_id,
+          created_at: {
+            $gte: new Date(now.getFullYear(), now.getMonth(), 1),
+            $lt: new Date(now.getFullYear(), now.getMonth() + 1, 1),
+          },
+        });
+
+        // If all members have paid (minus the recipient themselves)
+        const totalMembers = await CampaignMember.countDocuments({
+          campaign_id: campaignId,
+        });
+
+        if (contributionCount >= totalMembers - 1) {
+          // Mark as having received payout
+          recipientMember.has_received_payout = true;
+          await recipientMember.save();
+        }
+      }
+    }
+
+    // Notify the recipient via socket if available
+    const io = req.app.get('io');
+    if (io) {
+      const recipientSocketId = [...io.sockets.sockets.values()].find(
+        (socket) => socket.userId === recipient_id
+      )?.id;
+
+      if (recipientSocketId) {
+        io.to(recipientSocketId).emit('payment-received', {
+          campaignId,
+          amount,
+          from: contributor_id,
+          contributionId: contribution._id,
+        });
+      }
+    }
+
+    // Return the created contribution
+    const populatedContribution = await Contribution.findById(contribution._id)
+      .populate('contributor_id', 'name email')
+      .populate('recipient_id', 'name email');
+
+    res.status(201).json({
+      message: 'Contribution recorded successfully',
+      contribution: populatedContribution,
+    });
+  } catch (error) {
+    console.error('Error recording contribution:', error);
+    res.status(500).json({
+      message: 'Failed to record contribution',
+      error: error.message,
+    });
+  }
+};
+
+/**
+ * Get all contributions for a campaign
+ */
+exports.getCampaignContributions = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const campaignId = id;
+    const userId = req.userId;
+
+    // Check if user is a member of the campaign
+    const isMember = await CampaignMember.exists({
+      campaign_id: campaignId,
+      user_id: userId,
+    });
+
+    if (!isMember) {
+      return res.status(403).json({
+        message: 'Not authorized to view campaign contributions',
+      });
+    }
+
+    // Get all contributions for the campaign
+    const contributions = await Contribution.find({ campaign_id: campaignId })
+      .populate('contributor_id', 'name email')
+      .populate('recipient_id', 'name email')
+      .sort({ created_at: -1 });
+
+    res.status(200).json(contributions);
+  } catch (error) {
+    console.error('Error fetching campaign contributions:', error);
+    res.status(500).json({
+      message: 'Failed to fetch contributions',
+      error: error.message,
+    });
+  }
+};
+
+/**
+ * Get all contributions made by or received by the current user
+ */
+exports.getUserContributions = async (req, res) => {
+  try {
+    const userId = req.userId;
+
+    // Get all contributions where the user is either contributor or recipient
+    const contributions = await Contribution.find({
+      $or: [{ contributor_id: userId }, { recipient_id: userId }],
+    })
+      .populate('campaign_id', 'name')
+      .populate('contributor_id', 'name email')
+      .populate('recipient_id', 'name email')
+      .sort({ created_at: -1 });
+
+    res.status(200).json(contributions);
+  } catch (error) {
+    console.error('Error fetching user contributions:', error);
+    res.status(500).json({
+      message: 'Failed to fetch contributions',
       error: error.message,
     });
   }
