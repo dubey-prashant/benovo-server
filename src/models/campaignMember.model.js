@@ -16,6 +16,16 @@ const campaignMemberSchema = new mongoose.Schema(
       type: Boolean,
       default: false,
     },
+    // Add month allocation field
+    allocated_month: {
+      type: Date,
+      default: null,
+    },
+    // Whether the member has received their payout for their allocated month
+    has_received_payout: {
+      type: Boolean,
+      default: false,
+    },
     created_at: { type: Date, default: Date.now },
   },
   { timestamps: true }

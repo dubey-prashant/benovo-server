@@ -152,6 +152,77 @@ exports.getCampaignById = async (req, res) => {
   }
 };
 
+exports.deleteCampaign = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const userId = req.userId;
+
+    // Find the campaign
+    const campaign = await Campaign.findById(id);
+
+    if (!campaign) {
+      return res.status(404).json({ message: 'Campaign not found' });
+    }
+
+    // Check if user is an admin of the campaign
+    const isAdmin = await CampaignMember.exists({
+      campaign_id: id,
+      user_id: userId,
+      is_admin: true,
+    });
+
+    if (!isAdmin) {
+      return res.status(403).json({
+        message: 'Not authorized to delete this campaign',
+      });
+    }
+
+    // Delete all members
+    await CampaignMember.deleteMany({ campaign_id: id });
+
+    // Delete all invitations
+    await Invitation.deleteMany({ campaign_id: id });
+
+    // Delete the campaign
+    await Campaign.findByIdAndDelete(id);
+
+    // Notify all members via socket if available
+    const io = req.app.get('io');
+    if (io) {
+      // Get all member user IDs except the one who deleted the campaign
+      const memberUserIds = await CampaignMember.find({
+        campaign_id: id,
+        user_id: { $ne: userId },
+      }).distinct('user_id');
+
+      // Send notification to each connected member
+      memberUserIds.forEach((memberId) => {
+        const memberSocketId = [...io.sockets.sockets.values()].find(
+          (socket) => socket.userId === memberId.toString()
+        )?.id;
+
+        if (memberSocketId) {
+          io.to(memberSocketId).emit('campaign-deleted', {
+            campaignId: id,
+            message: `Campaign "${campaign.name}" has been deleted`,
+          });
+        }
+      });
+    }
+
+    res.status(200).json({
+      message: 'Campaign deleted successfully',
+      campaignId: id,
+    });
+  } catch (error) {
+    console.error('Error deleting campaign:', error);
+    res.status(500).json({
+      message: 'Failed to delete campaign',
+      error: error.message,
+    });
+  }
+};
+
 // Enhanced inviteMember function
 exports.inviteMember = async (req, res) => {
   try {
@@ -228,11 +299,9 @@ exports.inviteMember = async (req, res) => {
     });
 
     if (existingInvitation) {
-      return res
-        .status(400)
-        .json({
-          message: 'This user has already been invited to this campaign',
-        });
+      return res.status(400).json({
+        message: 'This user has already been invited to this campaign',
+      });
     }
 
     // Create invitation
@@ -417,11 +486,34 @@ exports.respondToInvitation = async (req, res) => {
         invitation.status = 'declined';
         await invitation.save();
 
-        return res
-          .status(400)
-          .json({
-            message: 'Campaign has reached its maximum member capacity',
-          });
+        return res.status(400).json({
+          message: 'Campaign has reached its maximum member capacity',
+        });
+      }
+
+      // Calculate the next available month
+      const startDate = campaign.start_date;
+      const existingMembers = await CampaignMember.find({
+        campaign_id: invitation.campaign_id,
+      }).sort({ allocated_month: 1 });
+
+      // Find the next available month
+      let allocatedMonth = new Date(startDate);
+      const allocatedMonths = existingMembers
+        .filter((m) => m.allocated_month)
+        .map((m) => m.allocated_month.getTime());
+
+      // If we have existing allocations, find the next available slot
+      if (allocatedMonths.length > 0) {
+        for (let i = 0; i < campaign.max_members; i++) {
+          const testDate = new Date(startDate);
+          testDate.setMonth(testDate.getMonth() + i);
+
+          if (!allocatedMonths.includes(testDate.getTime())) {
+            allocatedMonth = testDate;
+            break;
+          }
+        }
       }
 
       // Add user as member
@@ -429,6 +521,7 @@ exports.respondToInvitation = async (req, res) => {
         campaign_id: invitation.campaign_id,
         user_id: userId,
         is_admin: false,
+        allocated_month: allocatedMonth,
       });
 
       await member.save();
@@ -507,6 +600,143 @@ exports.getUserInvitations = async (req, res) => {
     console.error('Error fetching user invitations:', error);
     res.status(500).json({
       message: 'Failed to fetch invitations',
+      error: error.message,
+    });
+  }
+};
+
+exports.updateMemberAllocation = async (req, res) => {
+  try {
+    const { id, memberId } = req.params;
+    const campaignId = id;
+    const { allocated_month, has_received_payout } = req.body;
+    const userId = req.userId;
+
+    // Check if user is an admin
+    const isAdmin = await CampaignMember.exists({
+      campaign_id: campaignId,
+      user_id: userId,
+      is_admin: true,
+    });
+
+    if (!isAdmin) {
+      return res
+        .status(403)
+        .json({ message: 'Not authorized to update member allocations' });
+    }
+
+    // Prepare update object
+    const updateData = {};
+    if (allocated_month !== undefined) {
+      // Check if allocation date is already taken
+      const existingAllocation = await CampaignMember.findOne({
+        campaign_id: campaignId,
+        allocated_month: new Date(allocated_month),
+        _id: { $ne: memberId },
+      });
+
+      if (existingAllocation) {
+        return res.status(400).json({
+          message: 'This month is already allocated to another member',
+        });
+      }
+
+      updateData.allocated_month = new Date(allocated_month);
+    }
+
+    // Add payout status update if provided
+    if (has_received_payout !== undefined) {
+      updateData.has_received_payout = has_received_payout;
+    }
+
+    // Update the member's allocation
+    const updatedMember = await CampaignMember.findOneAndUpdate(
+      { _id: memberId, campaign_id: campaignId },
+      updateData,
+      { new: true }
+    );
+
+    if (!updatedMember) {
+      return res.status(404).json({ message: 'Member not found' });
+    }
+
+    res.status(200).json({
+      message: 'Member allocation updated successfully',
+      member: updatedMember,
+    });
+  } catch (error) {
+    console.error('Error updating member allocation:', error);
+    res.status(500).json({
+      message: 'Failed to update member allocation',
+      error: error.message,
+    });
+  }
+};
+
+exports.removeMember = async (req, res) => {
+  try {
+    const { id, memberId } = req.params;
+    const campaignId = id;
+    const userId = req.userId;
+
+    // Check if user is an admin of the campaign
+    const isAdmin = await CampaignMember.exists({
+      campaign_id: campaignId,
+      user_id: userId,
+      is_admin: true,
+    });
+
+    if (!isAdmin) {
+      return res
+        .status(403)
+        .json({ message: 'Not authorized to remove members' });
+    }
+
+    // Find the member to be removed
+    const memberToRemove = await CampaignMember.findOne({
+      _id: memberId,
+      campaign_id: campaignId,
+    }).populate('user_id', 'name email');
+
+    if (!memberToRemove) {
+      return res.status(404).json({ message: 'Member not found' });
+    }
+
+    // Prevent removing an admin
+    if (memberToRemove.is_admin) {
+      return res.status(400).json({ message: 'Cannot remove an admin member' });
+    }
+
+    // Delete the member
+    await CampaignMember.deleteOne({ _id: memberId });
+
+    // Notify the removed user via socket if available
+    const io = req.app.get('io');
+    if (io && memberToRemove.user_id) {
+      const memberSocketId = [...io.sockets.sockets.values()].find(
+        (socket) => socket.userId === memberToRemove.user_id._id.toString()
+      )?.id;
+
+      if (memberSocketId) {
+        io.to(memberSocketId).emit('removed-from-campaign', {
+          campaignId: campaignId,
+          message: 'You have been removed from the campaign',
+        });
+      }
+    }
+
+    res.status(200).json({
+      message: 'Member removed successfully',
+      removedMember: {
+        id: memberToRemove._id,
+        name: memberToRemove.user_id?.name || 'Unknown User',
+        email: memberToRemove.user_id?.email || '',
+      },
+    });
+  } catch (error) {
+    console.error('Error removing member:', error);
+    res.status(500).json({
+      message: 'Failed to remove member',
       error: error.message,
     });
   }
